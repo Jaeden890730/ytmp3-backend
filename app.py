@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import shutil
@@ -12,7 +13,7 @@ from pydantic import BaseModel, HttpUrl
 
 import yt_dlp
 
-app = FastAPI(title="YT to MP3 API", version="1.0.0")
+app = FastAPI(title="YT to MP3 API", version="1.1.0")
 
 # App (Flutter) calls are not blocked by browser CORS, but enabling CORS
 # makes it easier if you later add a Web frontend.
@@ -43,6 +44,50 @@ def _cleanup_dir(path: str) -> None:
         pass
 
 
+def _get_cookie_file() -> str | None:
+    """
+    Return a cookies.txt file path for yt-dlp.
+
+    Railway cannot use --cookies-from-browser because there is no real browser profile
+    inside the container. The safest deployment flow is:
+      1. Export YouTube cookies as a Netscape cookies.txt file locally.
+      2. Base64 encode the file.
+      3. Put the encoded string in Railway variable YTDLP_COOKIES_BASE64.
+
+    Also supported:
+      - YTDLP_COOKIES_FILE: an existing file path inside the container
+      - YTDLP_COOKIES: raw cookies.txt content, useful locally
+    """
+    cookie_file = os.getenv("YTDLP_COOKIES_FILE")
+    if cookie_file and Path(cookie_file).is_file():
+        return cookie_file
+
+    cookies_base64 = os.getenv("YTDLP_COOKIES_BASE64")
+    cookies_raw = os.getenv("YTDLP_COOKIES")
+
+    if not cookies_base64 and not cookies_raw:
+        return None
+
+    try:
+        if cookies_base64:
+            content = base64.b64decode(cookies_base64).decode("utf-8")
+        else:
+            # Allows either real newlines or escaped \n in environment variables.
+            content = cookies_raw.replace("\\n", "\n")
+    except Exception as exc:
+        raise RuntimeError("Invalid YouTube cookies env. Check YTDLP_COOKIES_BASE64/YTDLP_COOKIES.") from exc
+
+    cookie_path = Path(tempfile.gettempdir()) / "yt_dlp_youtube_cookies.txt"
+    cookie_path.write_text(content, encoding="utf-8")
+
+    try:
+        cookie_path.chmod(0o600)
+    except Exception:
+        pass
+
+    return str(cookie_path)
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -65,6 +110,17 @@ def youtube_to_mp3(req: ConvertRequest, bg: BackgroundTasks):
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
+        },
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -75,6 +131,10 @@ def youtube_to_mp3(req: ConvertRequest, bg: BackgroundTasks):
     }
 
     try:
+        cookie_file = _get_cookie_file()
+        if cookie_file:
+            ydl_opts["cookiefile"] = cookie_file
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(str(req.url), download=True)
 
@@ -99,7 +159,14 @@ def youtube_to_mp3(req: ConvertRequest, bg: BackgroundTasks):
         )
 
     except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=f"yt-dlp download error: {e}")
+        msg = str(e)
+        if "Sign in to confirm" in msg or "not a bot" in msg:
+            msg = (
+                "YouTube is requiring authentication/cookies for this video or server IP. "
+                "Set Railway variable YTDLP_COOKIES_BASE64 with a valid Netscape cookies.txt file. "
+                f"Original yt-dlp error: {e}"
+            )
+        raise HTTPException(status_code=400, detail=f"yt-dlp download error: {msg}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
